@@ -897,6 +897,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ══════════════════════════════════════════════════════════════
+#  Admin command
+# ══════════════════════════════════════════════════════════════
+
+async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin panel — stats and management."""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_USER_IDS:
+        return
+
+    pool = await db.get_pool()
+    async with pool.acquire() as conn:
+        user_count = await conn.fetchval("SELECT COUNT(*) FROM users")
+        addr_count = await conn.fetchval("SELECT COUNT(*) FROM monitored_addresses WHERE is_active=1")
+        paid_count = await conn.fetchval("SELECT COUNT(*) FROM subscriptions WHERE is_active=1 AND plan != 'free'")
+
+    text = (
+        "🔧 <b>Админ-панель</b>\n\n"
+        f"👤 Пользователей: {user_count}\n"
+        f"📍 Адресов (активных): {addr_count}\n"
+        f"💳 Платных подписок: {paid_count}\n"
+    )
+    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+# ══════════════════════════════════════════════════════════════
 #  Background tasks
 # ══════════════════════════════════════════════════════════════
 
@@ -1018,6 +1043,7 @@ def main():
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("plan", cmd_plan))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("admin", cmd_admin))
 
     # Callback handler for inline buttons
     app.add_handler(CallbackQueryHandler(callback_handler))
