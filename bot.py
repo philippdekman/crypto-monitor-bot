@@ -60,19 +60,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.create_free_subscription(user.id)
 
     text = (
-        f"👋 Привет, {user.first_name}!\n\n"
-        f"Я мониторю крипто-адреса и сообщаю о входящих/исходящих транзакциях.\n\n"
-        f"<b>Поддерживаемые сети:</b>\n"
-        f"• Bitcoin (BTC)\n"
-        f"• Ethereum (ETH + ERC-20 токены)\n"
-        f"• BNB Smart Chain (BNB + BEP-20 токены)\n"
-        f"• TRON (TRX + TRC-20 токены)\n\n"
-        f"🆓 Бесплатно — до {FREE_ADDRESS_LIMIT} адресов\n"
-        f"⭐ Подписка — до {PRICING['basic']['max_addresses']}+ адресов\n\n"
-        f"<b>Как начать:</b>\n"
-        f"Отправьте мне крипто-адрес или используйте /add &lt;адрес&gt;"
+        f"👋 <b>Привет, {user.first_name}!</b>\n\n"
+        f"Я мониторю крипто-адреса и сообщаю о входящих/исходящих транзакциях в реальном времени.\n\n"
+        f"<b>🔗 Поддерживаемые сети:</b>\n"
+        f"  ₿  Bitcoin (BTC)\n"
+        f"  ⟠  Ethereum (ETH + ERC-20)\n"
+        f"  ⬡  BNB Smart Chain (BNB + BEP-20)\n"
+        f"  ◈  TRON (TRX + TRC-20)\n\n"
+        f"🆓 Бесплатно — до <b>{FREE_ADDRESS_LIMIT}</b> адресов\n"
+        f"⭐ Подписка — до <b>{PRICING['basic']['max_addresses']}+</b> адресов\n\n"
+        f"Выберите действие:"
     )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    keyboard = [
+        [InlineKeyboardButton("➕ Добавить адрес", callback_data="menu_add"),
+         InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+        [InlineKeyboardButton("💳 Подписка", callback_data="menu_subscribe"),
+         InlineKeyboardButton("ℹ️ Помощь", callback_data="menu_help")],
+    ]
+    await update.message.reply_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML
+    )
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -224,9 +231,200 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = query.data
     user_id = update.effective_user.id
 
+    # ── Main menu buttons ─────────────────────────────────
+
+    if data == "menu_main":
+        user = update.effective_user
+        text = (
+            f"👋 <b>Привет, {user.first_name}!</b>\n\n"
+            f"Я мониторю крипто-адреса и сообщаю о входящих/исходящих транзакциях в реальном времени.\n\n"
+            f"<b>🔗 Поддерживаемые сети:</b>\n"
+            f"  ₿  Bitcoin (BTC)\n"
+            f"  ⟠  Ethereum (ETH + ERC-20)\n"
+            f"  ⬡  BNB Smart Chain (BNB + BEP-20)\n"
+            f"  ◈  TRON (TRX + TRC-20)\n\n"
+            f"🆓 Бесплатно — до <b>{FREE_ADDRESS_LIMIT}</b> адресов\n"
+            f"⭐ Подписка — до <b>{PRICING['basic']['max_addresses']}+</b> адресов\n\n"
+            f"Выберите действие:"
+        )
+        keyboard = [
+            [InlineKeyboardButton("➕ Добавить адрес", callback_data="menu_add"),
+             InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+            [InlineKeyboardButton("💳 Подписка", callback_data="menu_subscribe"),
+             InlineKeyboardButton("ℹ️ Помощь", callback_data="menu_help")],
+        ]
+        await query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "menu_add":
+        await query.edit_message_text(
+            "✏️ Отправьте крипто-адрес для мониторинга.\n\n"
+            "Поддерживаемые форматы:\n"
+            "• <b>BTC:</b> 1..., 3..., bc1...\n"
+            "• <b>ETH/BSC:</b> 0x...\n"
+            "• <b>TRON:</b> T...\n\n"
+            "Или используйте команду:\n<code>/add &lt;адрес&gt;</code>",
+            parse_mode=ParseMode.HTML
+        )
+        return
+
+    if data == "menu_list":
+        await cmd_list(update, context)
+        return
+
+    if data == "menu_subscribe":
+        await show_subscription_menu(query, user_id)
+        return
+
+    if data == "menu_help":
+        text = (
+            "📖 <b>Помощь</b>\n\n"
+            "<b>Как добавить адрес:</b>\n"
+            "Просто отправьте крипто-адрес в чат — я определю сеть автоматически.\n\n"
+            "<b>Команды:</b>\n"
+            "/add &lt;адрес&gt; — добавить адрес\n"
+            "/list — мои адреса\n"
+            "/remove — удалить адрес\n"
+            "/balance — проверить балансы\n"
+            "/plan — текущий план\n"
+            "/subscribe — оформить подписку\n"
+            "/help — эта справка\n\n"
+            "🔔 Я буду уведомлять вас о транзакциях свыше $10."
+        )
+        keyboard = [[InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")]]
+        await query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML
+        )
+        return
+
+    # ── Per-address actions ───────────────────────────────
+
+    if data.startswith("addr_balance:"):
+        monitor_id = int(data.split(":")[1])
+        addresses = await db.get_user_addresses(user_id)
+        addr = next((a for a in addresses if a["id"] == monitor_id), None)
+        if not addr:
+            await query.edit_message_text("❌ Адрес не найден.")
+            return
+        chain_name = CHAIN_HANDLERS.get(addr["chain"], {}).get("name", addr["chain"])
+        symbol = addr["token_symbol"] or CHAIN_HANDLERS.get(addr["chain"], {}).get("native_symbol", "?")
+
+        await query.edit_message_text(
+            f"<b>{chain_name} — {symbol}</b>\n"
+            f"<code>{addr['address']}</code>\n\n"
+            f"⏳ Загружаю баланс...",
+            parse_mode=ParseMode.HTML,
+        )
+
+        balance_info = await get_initial_balance(
+            addr["chain"], addr["address"],
+            addr["token_contract"], addr["token_symbol"]
+        )
+        balance = balance_info.get("balance", "—")
+        balance_usd = balance_info.get("balance_usd", 0)
+        display_symbol = balance_info.get("symbol", symbol)
+
+        buttons = [
+            [InlineKeyboardButton("🔄 Заменить", callback_data=f"addr_replace:{monitor_id}"),
+             InlineKeyboardButton("🗑 Удалить", callback_data=f"addr_delete:{monitor_id}")],
+            [InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+        ]
+        await query.edit_message_text(
+            f"<b>{chain_name} — {display_symbol}</b>\n"
+            f"<code>{addr['address']}</code>\n\n"
+            f"💰 <b>{balance} {display_symbol}</b>\n"
+            f"💵 ≈ ${balance_usd:,.2f}",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("addr_replace:"):
+        monitor_id = int(data.split(":")[1])
+        addresses = await db.get_user_addresses(user_id)
+        addr = next((a for a in addresses if a["id"] == monitor_id), None)
+        if not addr:
+            await query.edit_message_text("❌ Адрес не найден.")
+            return
+
+        # Delete the old address
+        await db.remove_monitored_address(monitor_id, user_id)
+
+        # Store replace state so the next address message completes the flow
+        context.user_data["replacing_address"] = {
+            "old_address": addr["address"],
+            "old_chain": addr["chain"],
+            "old_symbol": addr["token_symbol"] or CHAIN_HANDLERS.get(addr["chain"], {}).get("native_symbol", "?"),
+        }
+
+        chain_name = CHAIN_HANDLERS.get(addr["chain"], {}).get("name", addr["chain"])
+        symbol = addr["token_symbol"] or CHAIN_HANDLERS.get(addr["chain"], {}).get("native_symbol", "?")
+
+        keyboard = [[InlineKeyboardButton("❌ Отмена замены", callback_data="cancel_replace")]]
+        await query.edit_message_text(
+            f"🔄 <b>Замена адреса</b>\n\n"
+            f"Старый адрес удалён:\n"
+            f"<s>{chain_name} — {symbol}</s>\n"
+            f"<code>{addr['address'][:20]}...</code>\n\n"
+            f"✏️ Отправьте новый крипто-адрес:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "cancel_replace":
+        context.user_data.pop("replacing_address", None)
+        await query.edit_message_text(
+            "❌ Замена отменена.\n\n"
+            "⚠️ Старый адрес уже был удалён. "
+            "Используйте ➕ <b>Добавить адрес</b> чтобы добавить его заново.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("addr_delete:"):
+        monitor_id = int(data.split(":")[1])
+        addresses = await db.get_user_addresses(user_id)
+        addr = next((a for a in addresses if a["id"] == monitor_id), None)
+        if not addr:
+            await query.edit_message_text("❌ Адрес не найден.")
+            return
+
+        chain_name = CHAIN_HANDLERS.get(addr["chain"], {}).get("name", addr["chain"])
+        symbol = addr["token_symbol"] or CHAIN_HANDLERS.get(addr["chain"], {}).get("native_symbol", "?")
+
+        keyboard = [
+            [InlineKeyboardButton("✅ Да, удалить", callback_data=f"addr_confirm_delete:{monitor_id}"),
+             InlineKeyboardButton("❌ Нет", callback_data="menu_list")],
+        ]
+        await query.edit_message_text(
+            f"🗑 <b>Удалить адрес?</b>\n\n"
+            f"{chain_name} — {symbol}\n"
+            f"<code>{addr['address']}</code>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data.startswith("addr_confirm_delete:"):
+        monitor_id = int(data.split(":")[1])
+        await db.remove_monitored_address(monitor_id, user_id)
+        keyboard = [[InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")]]
+        await query.edit_message_text(
+            "✅ Адрес удалён из мониторинга.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
+    # ── Cancel ────────────────────────────────────────────
+
     if data == "cancel":
         await query.edit_message_text("❌ Отменено.")
         return
+
+    # ── Chain / monitor selection (from /add flow) ────────
 
     if data.startswith("select_chain:"):
         chain = data.split(":")[1]
@@ -287,6 +485,15 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 query, user_id, address, chain,
                 token_contract=token_contract, token_symbol=token_symbol
             )
+
+        # Clear replace state after successful add
+        if context.user_data.pop("replacing_address", None):
+            await query.message.reply_text(
+                "✅ Адрес успешно заменён!",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")]]
+                ),
+            )
         return
 
     # ── Subscription flow ─────────────────────────────────
@@ -320,7 +527,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await check_payment_status(query, user_id, payment_id)
         return
 
-    # ── Remove address ────────────────────────────────────
+    # ── Remove address (legacy) ───────────────────────────
 
     if data.startswith("rm:"):
         monitor_id = int(data.split(":")[1])
@@ -368,7 +575,13 @@ async def add_and_show_balance(query, user_id, address, chain,
         + format_balance_message(balance_info, label)
         + "\n\n🔔 Буду сообщать о новых транзакциях свыше $10."
     )
-    await query.edit_message_text(text, parse_mode=ParseMode.HTML)
+    keyboard = [
+        [InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list"),
+         InlineKeyboardButton("🏠 Меню", callback_data="menu_main")],
+    ]
+    await query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML
+    )
 
 
 # ── Subscription menu ────────────────────────────────────────
@@ -502,44 +715,62 @@ async def check_payment_status(query, user_id, payment_id):
 # ── List / Remove / Balance ──────────────────────────────────
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show address list — works from both /list command and menu_list callback."""
     user_id = update.effective_user.id
     addresses = await db.get_user_addresses(user_id)
 
     if not addresses:
-        await update.message.reply_text(
-            "📭 У вас нет отслеживаемых адресов.\n"
-            "Отправьте крипто-адрес, чтобы начать мониторинг."
-        )
+        keyboard = [[InlineKeyboardButton("➕ Добавить адрес", callback_data="menu_add")]]
+        text = "📭 У вас нет отслеживаемых адресов.\nОтправьте крипто-адрес, чтобы начать мониторинг."
+        if update.message:
+            await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+        else:
+            await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
     info = await get_user_plan_info(user_id)
-    msg = await update.message.reply_text(
-        f"📋 <b>Ваши адреса</b> ({len(addresses)}/{info['max_addresses']})\n\n⏳ Загружаю балансы...",
-        parse_mode=ParseMode.HTML
-    )
 
-    text = f"📋 <b>Ваши адреса</b> ({len(addresses)}/{info['max_addresses']})\n\n"
+    # Send or edit initial "loading" message
+    header = f"📋 <b>Ваши адреса</b> ({len(addresses)}/{info['max_addresses']})"
+    if update.message:
+        msg = await update.message.reply_text(
+            f"{header}\n\n⏳ Загружаю...", parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.callback_query.edit_message_text(
+            f"{header}\n\n⏳ Загружаю...", parse_mode=ParseMode.HTML
+        )
+        msg = update.callback_query.message
 
+    # Build per-address cards with inline buttons
     for i, addr in enumerate(addresses, 1):
         chain_name = CHAIN_HANDLERS.get(addr["chain"], {}).get("name", addr["chain"])
         symbol = addr["token_symbol"] or CHAIN_HANDLERS.get(addr["chain"], {}).get("native_symbol", "?")
+        aid = addr["id"]
 
-        # Fetch live balance for the correct token
-        balance_info = await get_initial_balance(
-            addr["chain"], addr["address"],
-            addr["token_contract"], addr["token_symbol"]
+        card_text = (
+            f"<b>{i}. {chain_name} — {symbol}</b>\n"
+            f"<code>{addr['address']}</code>"
         )
-        balance = balance_info.get("balance", "—")
-        balance_usd = balance_info.get("balance_usd", 0)
-        display_symbol = balance_info.get("symbol", symbol)
-
-        text += (
-            f"<b>{i}.</b> {chain_name} — {display_symbol}\n"
-            f"   <code>{addr['address'][:20]}...</code>\n"
-            f"   🪙 {balance} {display_symbol} (${balance_usd:,.2f})\n\n"
+        buttons = [
+            InlineKeyboardButton("💰 Баланс", callback_data=f"addr_balance:{aid}"),
+            InlineKeyboardButton("🔄 Заменить", callback_data=f"addr_replace:{aid}"),
+            InlineKeyboardButton("🗑 Удалить", callback_data=f"addr_delete:{aid}"),
+        ]
+        await msg.reply_text(
+            card_text,
+            reply_markup=InlineKeyboardMarkup([buttons]),
+            parse_mode=ParseMode.HTML,
         )
 
-    await msg.edit_text(text, parse_mode=ParseMode.HTML)
+    # Edit the loading message to a summary
+    footer_buttons = [
+        [InlineKeyboardButton("➕ Добавить адрес", callback_data="menu_add")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+    ]
+    await msg.edit_text(
+        header, reply_markup=InlineKeyboardMarkup(footer_buttons), parse_mode=ParseMode.HTML
+    )
 
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -649,12 +880,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.effective_user.username,
             update.effective_user.first_name
         )
+
         await process_address(update, context, text)
     else:
-        await update.message.reply_text(
-            "🤔 Не похоже на крипто-адрес.\n"
-            "Используйте /help для списка команд."
-        )
+        # If in replace flow, tell user the address is invalid
+        if context.user_data.get("replacing_address"):
+            await update.message.reply_text(
+                "❌ Не удалось определить блокчейн для этого адреса.\n"
+                "Отправьте корректный крипто-адрес или нажмите «Отмена замены» выше."
+            )
+        else:
+            await update.message.reply_text(
+                "🤔 Не похоже на крипто-адрес.\n"
+                "Используйте /help для списка команд."
+            )
 
 
 # ══════════════════════════════════════════════════════════════
