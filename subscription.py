@@ -11,14 +11,14 @@ from prices import convert_from_usd
 logger = logging.getLogger(__name__)
 
 
-def get_user_plan_info(user_id: int) -> dict:
+async def get_user_plan_info(user_id: int) -> dict:
     """Get current plan details for a user."""
-    sub = db.get_active_subscription(user_id)
+    sub = await db.get_active_subscription(user_id)
     if not sub or sub["plan"] == "free":
         return {
             "plan": "free",
             "max_addresses": FREE_ADDRESS_LIMIT,
-            "current_addresses": db.count_user_addresses(user_id),
+            "current_addresses": await db.count_user_addresses(user_id),
             "expires_at": None,
             "is_active": True,
         }
@@ -28,16 +28,16 @@ def get_user_plan_info(user_id: int) -> dict:
         "plan": sub["plan"],
         "period": sub["period"],
         "max_addresses": plan_config.get("max_addresses", FREE_ADDRESS_LIMIT),
-        "current_addresses": db.count_user_addresses(user_id),
+        "current_addresses": await db.count_user_addresses(user_id),
         "expires_at": sub["expires_at"],
         "started_at": sub["started_at"],
         "is_active": sub["is_active"] == 1,
     }
 
 
-def can_add_address(user_id: int) -> tuple[bool, str]:
+async def can_add_address(user_id: int) -> tuple[bool, str]:
     """Check if user can add another address."""
-    info = get_user_plan_info(user_id)
+    info = await get_user_plan_info(user_id)
     if info["current_addresses"] >= info["max_addresses"]:
         if info["plan"] == "free":
             return False, (
@@ -65,7 +65,7 @@ async def create_payment_invoice(user_id: int, plan: str, period: str, pay_chain
         return None
 
     # Get next HD wallet index and generate address
-    idx = db.get_next_hd_index(pay_chain)
+    idx = await db.get_next_hd_index(pay_chain)
     addr_info = generate_address(pay_chain, idx)
     if not addr_info:
         return None
@@ -78,7 +78,7 @@ async def create_payment_invoice(user_id: int, plan: str, period: str, pay_chain
         return None
 
     # Create payment record
-    payment = db.create_payment(
+    payment = await db.create_payment(
         user_id=user_id,
         plan=plan,
         period=period,
@@ -107,7 +107,7 @@ async def check_pending_payments() -> list[dict]:
     from chains import get_transactions
 
     confirmed = []
-    pending = db.get_pending_payments()
+    pending = await db.get_pending_payments()
 
     for payment in pending:
         pay_chain = payment["pay_chain"]
@@ -120,11 +120,11 @@ async def check_pending_payments() -> list[dict]:
                 received = float(tx["value"])
                 # Allow 1% tolerance for network fees
                 if received >= expected_amount * 0.99:
-                    db.confirm_payment(payment["id"], tx["tx_hash"])
+                    await db.confirm_payment(payment["id"], tx["tx_hash"])
 
                     # Activate subscription
                     duration = 365 if payment["period"] == "yearly" else 30
-                    db.create_subscription(
+                    await db.create_subscription(
                         payment["user_id"], payment["plan"],
                         payment["period"], duration
                     )
@@ -140,19 +140,19 @@ async def check_pending_payments() -> list[dict]:
                     break
 
     # Expire old payments
-    db.expire_old_payments()
+    await db.expire_old_payments()
 
     return confirmed
 
 
-def get_expiring_subscriptions_to_notify() -> list[dict]:
+async def get_expiring_subscriptions_to_notify() -> list[dict]:
     """Get subscriptions that need reminder notifications."""
     notifications = []
 
     for days in REMINDER_DAYS:
-        subs = db.get_expiring_subscriptions(days)
+        subs = await db.get_expiring_subscriptions(days)
         for sub in subs:
-            db.mark_reminder_sent(sub["id"], days)
+            await db.mark_reminder_sent(sub["id"], days)
             remaining = sub["expires_at"] - time.time()
             days_left = max(1, int(remaining / 86400))
 

@@ -10,8 +10,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY *.py .
 COPY .env.example .
 
-# Create data directory for SQLite
-RUN mkdir -p /app/data
-
 # Run bot
 CMD ["python", "bot.py"]

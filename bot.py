@@ -56,8 +56,8 @@ logger = logging.getLogger(__name__)
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    db.upsert_user(user.id, user.username, user.first_name, user.language_code or "en")
-    db.create_free_subscription(user.id)
+    await db.upsert_user(user.id, user.username, user.first_name, user.language_code or "en")
+    await db.create_free_subscription(user.id)
 
     text = (
         f"👋 Привет, {user.first_name}!\n\n"
@@ -94,7 +94,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    db.upsert_user(user_id, update.effective_user.username,
+    await db.upsert_user(user_id, update.effective_user.username,
                    update.effective_user.first_name)
 
     if not context.args:
@@ -113,7 +113,7 @@ async def process_address(update: Update, context: ContextTypes.DEFAULT_TYPE, ad
     user_id = update.effective_user.id
 
     # Check if can add
-    can, reason = can_add_address(user_id)
+    can, reason = await can_add_address(user_id)
     if not can:
         kb = [[InlineKeyboardButton("⭐ Оформить подписку", callback_data="subscribe")]]
         await update.message.reply_text(reason, reply_markup=InlineKeyboardMarkup(kb),
@@ -259,7 +259,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for token in tokens[:10]:
                     contract = token.get("contract", "")
                     sym = token.get("symbol", "TOKEN")
-                    mon = db.add_monitored_address(
+                    mon = await db.add_monitored_address(
                         user_id, address, chain,
                         token_contract=contract, token_symbol=sym,
                         label=f"{sym} on {chain}"
@@ -270,7 +270,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         try:
                             etxs = await _gt(chain, address, token_contract=contract)
                             if etxs:
-                                db.update_monitor_state(mon["id"], balance="0", last_tx_hash=etxs[0]["tx_hash"])
+                                await db.update_monitor_state(mon["id"], balance="0", last_tx_hash=etxs[0]["tx_hash"])
                         except Exception:
                             pass
                     added_count += 1
@@ -324,7 +324,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("rm:"):
         monitor_id = int(data.split(":")[1])
-        db.remove_monitored_address(monitor_id, user_id)
+        await db.remove_monitored_address(monitor_id, user_id)
         await query.edit_message_text("✅ Адрес удалён из мониторинга.")
         return
 
@@ -335,7 +335,7 @@ async def add_and_show_balance(query, user_id, address, chain,
     Records the latest existing tx hash so monitoring only alerts on NEW transactions."""
     label = f"{token_symbol or CHAIN_HANDLERS[chain]['native_symbol']} on {CHAIN_HANDLERS[chain]['name']}"
 
-    monitor = db.add_monitored_address(
+    monitor = await db.add_monitored_address(
         user_id, address, chain,
         token_contract=token_contract,
         token_symbol=token_symbol,
@@ -355,7 +355,7 @@ async def add_and_show_balance(query, user_id, address, chain,
         existing_txs = await chain_get_txs(chain, address, token_contract=token_contract)
         if existing_txs and monitor:
             latest_hash = existing_txs[0]["tx_hash"]
-            db.update_monitor_state(
+            await db.update_monitor_state(
                 monitor["id"],
                 balance=balance_info.get("balance", "0"),
                 last_tx_hash=latest_hash,
@@ -376,7 +376,7 @@ async def add_and_show_balance(query, user_id, address, chain,
 async def show_subscription_menu(query, user_id):
     text = format_pricing_text()
 
-    info = get_user_plan_info(user_id)
+    info = await get_user_plan_info(user_id)
     text += f"\n\n📍 Ваш текущий план: <b>{info['plan'].upper()}</b>"
     if info.get("expires_at"):
         exp = datetime.fromtimestamp(info["expires_at"]).strftime("%d.%m.%Y")
@@ -503,7 +503,7 @@ async def check_payment_status(query, user_id, payment_id):
 
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    addresses = db.get_user_addresses(user_id)
+    addresses = await db.get_user_addresses(user_id)
 
     if not addresses:
         await update.message.reply_text(
@@ -512,7 +512,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    info = get_user_plan_info(user_id)
+    info = await get_user_plan_info(user_id)
     msg = await update.message.reply_text(
         f"📋 <b>Ваши адреса</b> ({len(addresses)}/{info['max_addresses']})\n\n⏳ Загружаю балансы...",
         parse_mode=ParseMode.HTML
@@ -544,7 +544,7 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    addresses = db.get_user_addresses(user_id)
+    addresses = await db.get_user_addresses(user_id)
 
     if not addresses:
         await update.message.reply_text("📭 Нет адресов для удаления.")
@@ -568,7 +568,7 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    addresses = db.get_user_addresses(user_id)
+    addresses = await db.get_user_addresses(user_id)
 
     if not addresses:
         await update.message.reply_text("📭 Нет отслеживаемых адресов.")
@@ -589,7 +589,7 @@ async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    info = get_user_plan_info(user_id)
+    info = await get_user_plan_info(user_id)
 
     text = f"📦 <b>Ваш план: {info['plan'].upper()}</b>\n\n"
     text += f"📊 Адресов: {info['current_addresses']} / {info['max_addresses']}\n"
@@ -617,7 +617,7 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     text = format_pricing_text()
 
-    info = get_user_plan_info(user_id)
+    info = await get_user_plan_info(user_id)
     text += f"\n📍 Текущий план: <b>{info['plan'].upper()}</b>"
 
     buttons = [
@@ -644,7 +644,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Try to detect as crypto address
     chains = detect_chains(text)
     if chains:
-        db.upsert_user(
+        await db.upsert_user(
             update.effective_user.id,
             update.effective_user.username,
             update.effective_user.first_name
@@ -698,7 +698,7 @@ async def monitoring_loop(app: Application):
                     logger.error(f"Failed to notify payment for user {c['user_id']}: {e}")
 
             # Check subscription reminders
-            reminders = get_expiring_subscriptions_to_notify()
+            reminders = await get_expiring_subscriptions_to_notify()
             for r in reminders:
                 try:
                     days = r["days_left"]
@@ -717,7 +717,7 @@ async def monitoring_loop(app: Application):
                     logger.error(f"Failed to send reminder to {r['user_id']}: {e}")
 
             # Expire old subscriptions
-            db.expire_subscriptions()
+            await db.expire_subscriptions()
 
         except Exception as e:
             logger.error(f"Monitoring loop error: {e}")
@@ -727,6 +727,8 @@ async def monitoring_loop(app: Application):
 
 async def post_init(app: Application):
     """Post-initialization hook."""
+    await db.init_db()
+
     await app.bot.set_my_commands([
         BotCommand("start", "Начать работу"),
         BotCommand("add", "Добавить адрес"),
@@ -752,8 +754,6 @@ def main():
         print("ERROR: TELEGRAM_BOT_TOKEN not set!")
         print("Set it in .env or environment variables.")
         return
-
-    db.init_db()
 
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 

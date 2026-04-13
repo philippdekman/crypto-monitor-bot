@@ -1,5 +1,6 @@
 python-telegram-bot==21.6
 aiohttp==3.10.11
+asyncpg==0.30.0
 hdwallet>=3.6.0
 base58==2.1.1
 python-dotenv==1.0.1

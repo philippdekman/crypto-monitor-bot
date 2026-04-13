@@ -65,7 +65,7 @@ async def check_address(monitor: dict) -> list[dict]:
             continue
 
         # Log to database
-        was_new = db.log_transaction(
+        was_new = await db.log_transaction(
             monitor_id=monitor_id,
             tx_hash=tx["tx_hash"],
             direction=tx["direction"],
@@ -94,7 +94,7 @@ async def check_address(monitor: dict) -> list[dict]:
         balance_data = await get_balance(chain, address,
                                           token_contract=token_contract,
                                           token_symbol=token_symbol)
-        db.update_monitor_state(
+        await db.update_monitor_state(
             monitor_id,
             balance=balance_data.get("balance", "0"),
             last_tx_hash=latest_tx_hash,
@@ -108,7 +108,7 @@ async def run_monitoring_cycle() -> list[dict]:
     Run one full monitoring cycle across all active monitors.
     Returns list of all new transactions to notify about.
     """
-    monitors = db.get_all_active_monitors()
+    monitors = await db.get_all_active_monitors()
     all_new_txs = []
 
     # Process in batches to respect API rate limits
