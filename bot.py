@@ -750,17 +750,24 @@ async def post_init(app: Application):
 # ══════════════════════════════════════════════════════════════
 
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        print("ERROR: TELEGRAM_BOT_TOKEN not set!")
-        print("Set it in .env or environment variables.")
-        return
+    import sys
+
+    print("=== Crypto Monitor Bot starting ===", flush=True)
+    print(f"Python: {sys.version}", flush=True)
+    print(f"TELEGRAM_BOT_TOKEN: {'set' if TELEGRAM_BOT_TOKEN else 'NOT SET'}", flush=True)
 
     from config import DATABASE_URL
-    if not DATABASE_URL:
-        print("ERROR: DATABASE_URL not set!")
-        print("Add PostgreSQL add-on in Railway or set DATABASE_URL in environment variables.")
+    print(f"DATABASE_URL: {'set (' + DATABASE_URL[:25] + '...)' if DATABASE_URL else 'NOT SET'}", flush=True)
+
+    if not TELEGRAM_BOT_TOKEN:
+        print("ERROR: TELEGRAM_BOT_TOKEN not set!", flush=True)
         return
 
+    if not DATABASE_URL:
+        print("ERROR: DATABASE_URL not set!", flush=True)
+        return
+
+    print("Building application...", flush=True)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     # Command handlers
