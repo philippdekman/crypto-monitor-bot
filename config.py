@@ -52,5 +52,12 @@ MIN_TX_VALUE_USD = 10.0
 # Subscription reminders (days before expiry)
 REMINDER_DAYS = [30, 7, 3, 1]
 
-# Database (PostgreSQL on Railway — uses DATABASE_URL)
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# Database (PostgreSQL on Railway)
+# Railway may use different variable names depending on setup
+DATABASE_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("DATABASE_PUBLIC_URL")
+    or os.getenv("POSTGRES_URL")
+    or os.getenv("POSTGRES_PUBLIC_URL")
+    or ""
+)
