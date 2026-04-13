@@ -755,6 +755,12 @@ def main():
         print("Set it in .env or environment variables.")
         return
 
+    from config import DATABASE_URL
+    if not DATABASE_URL:
+        print("ERROR: DATABASE_URL not set!")
+        print("Add PostgreSQL add-on in Railway or set DATABASE_URL in environment variables.")
+        return
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(post_init).build()
 
     # Command handlers
