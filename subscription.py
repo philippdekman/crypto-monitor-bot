@@ -58,37 +58,63 @@ async def create_payment_invoice(user_id: int, plan: str, period: str, pay_chain
     """Create a payment invoice with a unique HD wallet address."""
     plan_config = PRICING.get(plan)
     if not plan_config:
+        logger.error(f"Unknown plan: {plan}")
         return None
 
     amount_usd = plan_config.get(period)
     if not amount_usd:
+        logger.error(f"Unknown period '{period}' for plan '{plan}'")
         return None
 
     # Get next HD wallet index and generate address
-    idx = await db.get_next_hd_index(pay_chain)
+    try:
+        idx = await db.get_next_hd_index(pay_chain)
+    except Exception as e:
+        logger.error(f"Failed to get HD index for {pay_chain}: {e}")
+        return None
+
     addr_info = generate_address(pay_chain, idx)
     if not addr_info:
+        logger.error(f"HD wallet address generation failed for {pay_chain} index {idx}")
         return None
 
     # Convert USD to crypto amount
     native_symbols = {"BTC": "BTC", "ETH": "ETH", "BSC": "BNB", "TRON": "TRX"}
     symbol = native_symbols.get(pay_chain, "ETH")
-    crypto_amount = await convert_from_usd(amount_usd, symbol)
+
+    # Retry price fetch up to 3 times (CoinGecko rate limits)
+    crypto_amount = None
+    for attempt in range(3):
+        crypto_amount = await convert_from_usd(amount_usd, symbol)
+        if crypto_amount is not None:
+            break
+        logger.warning(f"Price fetch failed for {symbol}, attempt {attempt + 1}/3")
+        import asyncio
+        await asyncio.sleep(2)
+
     if crypto_amount is None:
+        logger.error(f"Could not get price for {symbol} after 3 attempts")
         return None
 
     # Create payment record
-    payment = await db.create_payment(
-        user_id=user_id,
-        plan=plan,
-        period=period,
-        amount_usd=amount_usd,
-        pay_chain=pay_chain,
-        pay_address=addr_info["address"],
-        pay_amount=f"{crypto_amount:.8f}",
-        derivation_idx=idx,
-        expires_in=3600,  # 1 hour to pay
-    )
+    try:
+        payment = await db.create_payment(
+            user_id=user_id,
+            plan=plan,
+            period=period,
+            amount_usd=amount_usd,
+            pay_chain=pay_chain,
+            pay_address=addr_info["address"],
+            pay_amount=f"{crypto_amount:.8f}",
+            derivation_idx=idx,
+            expires_in=3600,  # 1 hour to pay
+        )
+    except Exception as e:
+        logger.error(f"Failed to create payment record: {e}")
+        return None
+
+    logger.info(f"Invoice created: user={user_id}, plan={plan}/{period}, "
+                f"{amount_usd} USD = {crypto_amount:.8f} {symbol}, addr={addr_info['address']}")
 
     return {
         "payment_id": payment["id"],
@@ -114,10 +140,17 @@ async def check_pending_payments() -> list[dict]:
         pay_address = payment["pay_address"]
         expected_amount = float(payment["pay_amount"])
 
-        txs = await get_transactions(pay_chain, pay_address)
+        try:
+            txs = await get_transactions(pay_chain, pay_address)
+        except Exception as e:
+            logger.error(f"Payment check failed for {pay_chain}:{pay_address}: {e}")
+            continue
+
         for tx in txs:
             if tx["direction"] == "in":
                 received = float(tx["value"])
+                logger.info(f"Payment tx found: {pay_chain}:{pay_address} received {received}, "
+                            f"expected {expected_amount}, tx={tx['tx_hash'][:16]}...")
                 # Allow 1% tolerance for network fees
                 if received >= expected_amount * 0.99:
                     await db.confirm_payment(payment["id"], tx["tx_hash"])
@@ -131,12 +164,15 @@ async def check_pending_payments() -> list[dict]:
 
                     confirmed.append({
                         "user_id": payment["user_id"],
+                        "payment_id": payment["id"],
                         "plan": payment["plan"],
                         "period": payment["period"],
                         "tx_hash": tx["tx_hash"],
                         "amount": tx["value"],
                         "symbol": tx["symbol"],
                     })
+                    logger.info(f"Payment confirmed: user={payment['user_id']}, "
+                                f"plan={payment['plan']}, tx={tx['tx_hash'][:16]}...")
                     break
 
     # Expire old payments

@@ -644,10 +644,25 @@ async def show_payment_chain_selection(query, plan, period):
 async def create_and_show_invoice(query, context, user_id, plan, period, pay_chain):
     await query.edit_message_text("⏳ Генерирую платёжный адрес...")
 
-    invoice = await create_payment_invoice(user_id, plan, period, pay_chain)
+    try:
+        invoice = await create_payment_invoice(user_id, plan, period, pay_chain)
+    except Exception as e:
+        logger.error(f"Invoice creation error: {e}")
+        invoice = None
+
     if not invoice:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Попробовать снова", callback_data=f"sub_pay:{plan}:{period}:{pay_chain}")],
+            [InlineKeyboardButton("💳 Другая валюта", callback_data=f"sub_period:{plan}:{period}")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+        ])
         await query.edit_message_text(
-            "❌ Ошибка при создании счёта. Попробуйте позже или выберите другую криптовалюту."
+            "❌ Не удалось создать счёт.\n\n"
+            "Возможные причины:\n"
+            "• Временная проблема с получением курса\n"
+            "• Ошибка генерации адреса\n\n"
+            "Попробуйте ещё раз или выберите другую криптовалюту.",
+            reply_markup=kb,
         )
         return
 
@@ -681,28 +696,37 @@ async def create_and_show_invoice(query, context, user_id, plan, period, pay_cha
 async def check_payment_status(query, user_id, payment_id):
     await query.answer("🔍 Проверяю...")
 
-    confirmed = await check_pending_payments()
+    try:
+        confirmed = await check_pending_payments()
+    except Exception as e:
+        logger.error(f"Payment check error: {e}")
+        confirmed = []
 
-    # Check if this payment was confirmed
+    # Check if this specific payment was confirmed
     for c in confirmed:
-        if c["user_id"] == user_id:
+        if c.get("payment_id") == payment_id or c["user_id"] == user_id:
             await query.edit_message_text(
                 f"✅ <b>Оплата подтверждена!</b>\n\n"
                 f"💰 Получено: {c['amount']} {c['symbol']}\n"
                 f"📦 План: {c['plan'].capitalize()} / {c['period']}\n"
                 f"🔗 TX: <code>{c['tx_hash'][:16]}...</code>\n\n"
-                f"🎉 Подписка активирована! Используйте /add для добавления адресов.",
+                f"🎉 Подписка активирована!",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+                ]),
                 parse_mode=ParseMode.HTML
             )
             return
 
     # Not yet confirmed
-    buttons = [[
-        InlineKeyboardButton(
+    buttons = [
+        [InlineKeyboardButton(
             "🔍 Проверить снова",
             callback_data=f"check_payment:{payment_id}"
-        )
-    ]]
+        )],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+    ]
     await query.edit_message_text(
         "⏳ Оплата пока не обнаружена.\n\n"
         "Транзакция может занять несколько минут.\n"
