@@ -30,7 +30,7 @@ from telegram.constants import ParseMode
 from config import (
     TELEGRAM_BOT_TOKEN, ADMIN_USER_IDS, MONITOR_INTERVAL_SECONDS,
     FREE_ADDRESS_LIMIT, PRICING, TOPUP_AMOUNTS, MIN_TOPUP_USD,
-    AML_CHECK_PRICE_USD, FREE_AML_CHECKS
+    AML_CHECK_PRICE_USD, NAME_CHECK_PRICE_USD, FREE_AML_CHECKS
 )
 import database as db
 from chains import detect_chains, CHAIN_HANDLERS, get_token_list
@@ -44,9 +44,11 @@ from subscription import (
     format_pricing_text
 )
 from balance import (
-    get_user_balance_info, create_topup_invoice, charge_aml_check
+    get_user_balance_info, create_topup_invoice, charge_aml_check,
+    charge_name_check
 )
 import aml
+import dilisense
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +85,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Добавить адрес", callback_data="menu_add"),
          InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+        [InlineKeyboardButton("👤 Проверка имени/компании", callback_data="menu_name_check")],
         [InlineKeyboardButton(f"💰 Баланс: ${balance_usd:.2f}", callback_data="menu_balance")],
         [InlineKeyboardButton("💳 Подписка", callback_data="menu_subscribe"),
          InlineKeyboardButton("ℹ️ Помощь", callback_data="menu_help")],
@@ -262,6 +265,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("➕ Добавить адрес", callback_data="menu_add"),
              InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+            [InlineKeyboardButton("👤 Проверка имени/компании", callback_data="menu_name_check")],
             [InlineKeyboardButton(f"💰 Баланс: ${balance_usd:.2f}", callback_data="menu_balance")],
             [InlineKeyboardButton("💳 Подписка", callback_data="menu_subscribe"),
              InlineKeyboardButton("ℹ️ Помощь", callback_data="menu_help")],
@@ -314,6 +318,37 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_balance":
         await show_balance_menu(query, user_id)
+        return
+
+    if data == "menu_name_check":
+        await show_name_check_type_menu(query)
+        return
+
+    if data == "name_check_individual":
+        context.user_data["awaiting_name_check"] = "individual"
+        await query.edit_message_text(
+            "👤 <b>Проверка физического лица</b>\n\n"
+            "✏️ Введите имя для проверки (например: Boris Johnson):",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "name_check_entity":
+        context.user_data["awaiting_name_check"] = "entity"
+        await query.edit_message_text(
+            "🏢 <b>Проверка организации</b>\n\n"
+            "✏️ Введите название компании (например: REYCO GMBH GERMANY):",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if data == "name_check_skip_details":
+        # User skips DOB/gender — proceed with check
+        name = context.user_data.pop("name_check_name", "")
+        if not name:
+            await query.edit_message_text("❌ Имя не найдено. Попробуйте снова.")
+            return
+        await perform_name_check(query, context, user_id, name, "individual")
         return
 
     # ── Per-address actions ───────────────────────────────
@@ -664,9 +699,10 @@ async def show_balance_menu(query, user_id):
 
     text = (
         f"💰 <b>Ваш баланс: ${balance_usd:.2f}</b>\n\n"
-        f"🔍 <b>AML-проверки:</b>\n"
+        f"🔍 <b>AML-проверки (адреса и имена):</b>\n"
         f"  Бесплатных осталось: {free_remaining}/{free_total} (план {plan.upper()})\n"
-        f"  Платных: ${AML_CHECK_PRICE_USD:.2f} за проверку\n"
+        f"  • AML адреса: ${AML_CHECK_PRICE_USD:.2f}\n"
+        f"  • Проверка имени: ${NAME_CHECK_PRICE_USD:.2f}\n"
     )
 
     buttons = [
@@ -813,6 +849,7 @@ async def show_balance_history(query, user_id, offset=0):
     type_labels = {
         "topup": "➕ Пополнение",
         "aml_check": "🔍 AML-проверка",
+        "name_check": "👤 Проверка имени",
         "refund": "↩️ Возврат",
         "bonus": "🎁 Бонус",
         "adjustment": "⚙️ Корректировка",
@@ -927,6 +964,212 @@ async def perform_aml_check(query, user_id, addr):
 
     buttons = [
         [InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+    ]
+    await query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+    )
+
+
+# ── Name check menu ─────────────────────────────────────────
+
+async def _show_name_check_result(msg, name, result, check_type, charge_msg):
+    """Format and show name check result via message edit."""
+    type_icon = "👤" if check_type == "individual" else "🏢"
+    risk_level = result.get("risk_level", "clean")
+
+    if "error" in result:
+        from config import NAME_CHECK_PRICE_CENTS
+        buttons = [[InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")]]
+        await msg.edit_text(
+            f"❌ Ошибка проверки: {result['error']}\n"
+            f"Средства возвращены на баланс.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if risk_level == "clean":
+        risk_emoji = "🟢"
+        risk_text = "Чисто"
+    elif risk_level == "low":
+        risk_emoji = "🟡"
+        risk_text = "Низкий"
+    elif risk_level == "medium":
+        risk_emoji = "🟡"
+        risk_text = "Средний"
+    else:
+        risk_emoji = "🔴"
+        risk_text = "Высокий"
+
+    if result.get("clean"):
+        text = (
+            f"{type_icon} <b>Проверка: {name}</b>\n\n"
+            f"{risk_emoji} <b>Чисто — совпадений не найдено</b>\n\n"
+            f"Проверено по: Sanctions, PEP, Criminal lists"
+        )
+    else:
+        text = (
+            f"{type_icon} <b>Проверка: {name}</b>\n\n"
+            f"{risk_emoji} <b>Риск: {risk_text}</b>\n"
+            f"Совпадений: {result['total_hits']}\n"
+        )
+        for hit in result.get("hits", [])[:5]:
+            text += "\nНайдено в:\n"
+            src_type = hit.get("source_type", "")
+            pep_type = hit.get("pep_type", "")
+            positions = hit.get("positions", [])
+            if src_type == "PEP":
+                pos_text = f" ({positions[0]})" if positions else ""
+                pep_label = f"Политик{pos_text}" if pep_type == "POLITICIAN" else pep_type
+                text += f"• PEP: {pep_label}\n"
+            elif src_type == "SANCTION":
+                text += f"• Санкции ({hit.get('source_id', '')})\n"
+            elif src_type == "CRIMINAL":
+                text += f"• Уголовный розыск ({hit.get('source_id', '')})\n"
+            citizenship = hit.get("citizenship", [])
+            if citizenship:
+                text += f"• Гражданство: {', '.join(citizenship)}\n"
+            source_id = hit.get("source_id", "")
+            if source_id:
+                text += f"\nИсточник: {source_id}\n"
+
+    if result.get("mock"):
+        text += "\n<i>(🧪 тестовый режим)</i>"
+
+    text += f"\n\n<i>{charge_msg}</i>"
+
+    buttons = [
+        [InlineKeyboardButton("🔄 Новая проверка", callback_data="menu_name_check")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+    ]
+    await msg.edit_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+    )
+
+
+async def show_name_check_type_menu(query):
+    buttons = [
+        [InlineKeyboardButton("👤 Физическое лицо", callback_data="name_check_individual")],
+        [InlineKeyboardButton("🏢 Организация", callback_data="name_check_entity")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu_main")],
+    ]
+    await query.edit_message_text(
+        "👤 <b>Проверка имени/компании</b>\n\n"
+        "Проверка по санкциям, PEP и уголовным спискам.\n\n"
+        "Выберите тип проверки:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def perform_name_check(query, context, user_id, name, check_type,
+                              dob=None, gender=None):
+    """Execute a name/entity check via Dilisense."""
+    await query.edit_message_text(
+        f"🔍 <b>Проверяем: {name}...</b>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Charge for the check
+    success, charge_msg = await charge_name_check(user_id, name)
+    if not success:
+        buttons = [
+            [InlineKeyboardButton("➕ Пополнить баланс", callback_data="topup_amount:select")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+        ]
+        await query.edit_message_text(
+            f"❌ {charge_msg}",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Perform check
+    if check_type == "individual":
+        result = await dilisense.check_individual(name, dob=dob, gender=gender)
+    else:
+        result = await dilisense.check_entity(name)
+
+    if "error" in result:
+        # Refund on error
+        from config import NAME_CHECK_PRICE_CENTS
+        await db.credit_balance(
+            user_id, NAME_CHECK_PRICE_CENTS,
+            description="Возврат за неудачную проверку имени",
+            reference_id=name,
+            tx_type="refund",
+        )
+        buttons = [[InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")]]
+        await query.edit_message_text(
+            f"❌ Ошибка проверки: {result['error']}\n"
+            f"Средства возвращены на баланс.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Format result
+    type_icon = "👤" if check_type == "individual" else "🏢"
+    risk_level = result["risk_level"]
+
+    if risk_level == "clean":
+        risk_emoji = "🟢"
+        risk_text = "Чисто"
+    elif risk_level == "low":
+        risk_emoji = "🟡"
+        risk_text = "Низкий"
+    elif risk_level == "medium":
+        risk_emoji = "🟡"
+        risk_text = "Средний"
+    else:
+        risk_emoji = "🔴"
+        risk_text = "Высокий"
+
+    if result["clean"]:
+        text = (
+            f"{type_icon} <b>Проверка: {name}</b>\n\n"
+            f"{risk_emoji} <b>Чисто — совпадений не найдено</b>\n\n"
+            f"Проверено по: Sanctions, PEP, Criminal lists"
+        )
+    else:
+        text = (
+            f"{type_icon} <b>Проверка: {name}</b>\n\n"
+            f"{risk_emoji} <b>Риск: {risk_text}</b>\n"
+            f"Совпадений: {result['total_hits']}\n"
+        )
+
+        # Show hit details
+        for hit in result["hits"][:5]:
+            text += "\nНайдено в:\n"
+            src_type = hit.get("source_type", "")
+            pep_type = hit.get("pep_type", "")
+            positions = hit.get("positions", [])
+
+            if src_type == "PEP":
+                pos_text = f" ({positions[0]})" if positions else ""
+                pep_label = f"Политик{pos_text}" if pep_type == "POLITICIAN" else pep_type
+                text += f"• PEP: {pep_label}\n"
+            elif src_type == "SANCTION":
+                text += f"• Санкции ({hit.get('source_id', '')})\n"
+            elif src_type == "CRIMINAL":
+                text += f"• Уголовный розыск ({hit.get('source_id', '')})\n"
+
+            citizenship = hit.get("citizenship", [])
+            if citizenship:
+                text += f"• Гражданство: {', '.join(citizenship)}\n"
+
+            source_id = hit.get("source_id", "")
+            if source_id:
+                text += f"\nИсточник: {source_id}\n"
+
+    if result.get("mock"):
+        text += "\n<i>(🧪 тестовый режим)</i>"
+
+    text += f"\n\n<i>{charge_msg}</i>"
+
+    buttons = [
+        [InlineKeyboardButton("🔄 Новая проверка", callback_data="menu_name_check")],
         [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
     ]
     await query.edit_message_text(
@@ -1244,6 +1487,94 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Skip if it looks like a command
     if text.startswith("/"):
+        return
+
+    # Handle name check input
+    name_check_type = context.user_data.get("awaiting_name_check")
+    if name_check_type:
+        context.user_data.pop("awaiting_name_check", None)
+        name = text.strip()
+        if len(name) < 2:
+            await update.message.reply_text(
+                "❌ Слишком короткое имя. Введите полное имя или название.",
+            )
+            return
+
+        if name_check_type == "individual":
+            # Store name, ask if they want to add DOB/gender or skip
+            context.user_data["name_check_name"] = name
+            buttons = [
+                [InlineKeyboardButton("⏩ Пропустить и проверить", callback_data="name_check_skip_details")],
+            ]
+            # For simplicity, just proceed with the check (DOB/gender optional)
+            # Send a message with skip button, then do the check
+            msg = await update.message.reply_text(
+                f"👤 <b>Проверка: {name}</b>\n\n"
+                f"Можете отправить дату рождения (дд/мм/гггг) для уточнения, "
+                f"или нажмите кнопку ниже чтобы проверить без неё:",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.HTML,
+            )
+            context.user_data["name_check_msg_id"] = msg.message_id
+            context.user_data["awaiting_name_dob"] = True
+        else:
+            # Entity — check immediately
+            msg = await update.message.reply_text(
+                f"🔍 <b>Проверяем: {name}...</b>",
+                parse_mode=ParseMode.HTML,
+            )
+            user_id = update.effective_user.id
+            success, charge_msg = await charge_name_check(user_id, name)
+            if not success:
+                buttons = [
+                    [InlineKeyboardButton("➕ Пополнить баланс", callback_data="topup_amount:select")],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+                ]
+                await msg.edit_text(
+                    f"❌ {charge_msg}",
+                    reply_markup=InlineKeyboardMarkup(buttons),
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            result = await dilisense.check_entity(name)
+            await _show_name_check_result(msg, name, result, "entity", charge_msg)
+        return
+
+    # Handle DOB input for individual name check
+    if context.user_data.get("awaiting_name_dob"):
+        context.user_data.pop("awaiting_name_dob", None)
+        name = context.user_data.pop("name_check_name", "")
+        msg_id = context.user_data.pop("name_check_msg_id", None)
+        if not name:
+            return
+
+        # Validate DOB format
+        dob = text.strip()
+        import re
+        if not re.match(r'^\d{2}/\d{2}/\d{4}$', dob):
+            dob = None  # Invalid format, ignore and proceed without DOB
+
+        msg = await update.message.reply_text(
+            f"🔍 <b>Проверяем: {name}...</b>",
+            parse_mode=ParseMode.HTML,
+        )
+        user_id = update.effective_user.id
+        success, charge_msg = await charge_name_check(user_id, name)
+        if not success:
+            buttons = [
+                [InlineKeyboardButton("➕ Пополнить баланс", callback_data="topup_amount:select")],
+                [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+            ]
+            await msg.edit_text(
+                f"❌ {charge_msg}",
+                reply_markup=InlineKeyboardMarkup(buttons),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        result = await dilisense.check_individual(name, dob=dob)
+        await _show_name_check_result(msg, name, result, "individual", charge_msg)
         return
 
     # Handle custom topup amount

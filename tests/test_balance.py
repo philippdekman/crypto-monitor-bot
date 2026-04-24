@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 import pytest
 
 from config import (
-    MIN_TOPUP_USD, AML_CHECK_PRICE_CENTS, FREE_AML_CHECKS
+    MIN_TOPUP_USD, AML_CHECK_PRICE_CENTS, NAME_CHECK_PRICE_CENTS, FREE_AML_CHECKS
 )
 
 
@@ -294,6 +294,97 @@ class TestChargeAmlCheck:
         success, msg = await charge_aml_check(111, "TTestAddr123")
         assert success is False
         assert "Недостаточно" in msg
+
+
+class TestChargeNameCheck:
+    @pytest.mark.asyncio
+    async def test_charge_uses_free_first(self, patch_db):
+        db = patch_db
+        await db.upsert_user(222, "bob", "Bob")
+        await db.create_subscription(222, "basic", "monthly", 30)
+        await db.credit_balance(222, 1000)  # $10
+
+        from balance import charge_name_check
+        success, msg = await charge_name_check(222, "Boris Johnson")
+        assert success is True
+        assert "бесплатная" in msg.lower() or "Бесплатная" in msg
+
+        # Balance not touched (free check was used)
+        balance = await db.get_balance_cents(222)
+        assert balance == 1000
+
+    @pytest.mark.asyncio
+    async def test_charge_paid_when_no_free(self, patch_db):
+        db = patch_db
+        await db.upsert_user(111, "alice", "Alice")
+        await db.create_free_subscription(111)
+        await db.credit_balance(111, 500)  # $5
+
+        from balance import charge_name_check
+        success, msg = await charge_name_check(111, "Test Name")
+        assert success is True
+
+        balance = await db.get_balance_cents(111)
+        assert balance == 500 - NAME_CHECK_PRICE_CENTS
+
+    @pytest.mark.asyncio
+    async def test_charge_fails_insufficient_balance(self, patch_db):
+        db = patch_db
+        await db.upsert_user(111, "alice", "Alice")
+        await db.create_free_subscription(111)
+        # No balance at all
+
+        from balance import charge_name_check
+        success, msg = await charge_name_check(111, "Test Name")
+        assert success is False
+        assert "Недостаточно" in msg
+
+    @pytest.mark.asyncio
+    async def test_free_quota_shared_between_aml_and_name(self, patch_db):
+        """Free quota is shared: 3 free on Basic for BOTH AML + name checks."""
+        db = patch_db
+        await db.upsert_user(222, "bob", "Bob")
+        await db.create_subscription(222, "basic", "monthly", 30)
+        await db.credit_balance(222, 5000)  # $50
+
+        from balance import charge_aml_check, charge_name_check
+
+        # Use 2 free AML checks
+        success1, _ = await charge_aml_check(222, "addr1")
+        assert success1 is True
+        success2, _ = await charge_aml_check(222, "addr2")
+        assert success2 is True
+
+        # Use 1 free name check (third and last free check)
+        success3, msg3 = await charge_name_check(222, "Boris Johnson")
+        assert success3 is True
+        assert "бесплатная" in msg3.lower() or "Бесплатная" in msg3
+
+        # 4th check should be paid
+        success4, msg4 = await charge_name_check(222, "Another Name")
+        assert success4 is True
+        assert "Списано" in msg4
+
+        # Balance should be reduced by NAME_CHECK_PRICE_CENTS
+        balance = await db.get_balance_cents(222)
+        assert balance == 5000 - NAME_CHECK_PRICE_CENTS
+
+    @pytest.mark.asyncio
+    async def test_name_check_debit_type(self, patch_db):
+        """Paid name check should create transaction with type 'name_check'."""
+        db = patch_db
+        await db.upsert_user(111, "alice", "Alice")
+        await db.create_free_subscription(111)
+        await db.credit_balance(111, 500)
+
+        from balance import charge_name_check
+        await charge_name_check(111, "Test Name")
+
+        txs = await db.get_balance_transactions(111)
+        # Find the name_check transaction
+        name_txs = [t for t in txs if t["type"] == "name_check"]
+        assert len(name_txs) == 1
+        assert name_txs[0]["amount_cents"] == -NAME_CHECK_PRICE_CENTS
 
 
 class TestCreateTopupInvoice:

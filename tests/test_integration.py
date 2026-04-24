@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 
-from config import FREE_ADDRESS_LIMIT, PRICING, AML_CHECK_PRICE_CENTS, FREE_AML_CHECKS
+from config import FREE_ADDRESS_LIMIT, PRICING, AML_CHECK_PRICE_CENTS, NAME_CHECK_PRICE_CENTS, FREE_AML_CHECKS
 
 
 # ══════════════════════════════════════════════════════════════
@@ -384,3 +384,66 @@ class TestTopupAndAmlFlow:
         assert ok is True
         balance = await db.get_balance_cents(100)
         assert balance == 5000 - AML_CHECK_PRICE_CENTS
+
+
+# ══════════════════════════════════════════════════════════════
+#  Name check (Dilisense) integration
+# ══════════════════════════════════════════════════════════════
+
+class TestNameCheckIntegration:
+    @pytest.mark.asyncio
+    async def test_topup_basic_plan_mixed_free_then_paid(self, patch_db):
+        """Full flow: topup → Basic plan → 3 free checks (mix of AML + name) → 4th paid."""
+        db = patch_db
+        await db.upsert_user(500, "testuser", "TestUser")
+        await db.create_subscription(500, "basic", "monthly", 30)
+        await db.credit_balance(500, 2000)  # $20
+
+        from balance import charge_aml_check, charge_name_check, get_user_balance_info
+
+        # 1st free: AML address check
+        success, msg = await charge_aml_check(500, "0xABC123")
+        assert success is True
+
+        # 2nd free: Name check
+        success, msg = await charge_name_check(500, "Boris Johnson")
+        assert success is True
+
+        # 3rd free: Another name check
+        success, msg = await charge_name_check(500, "John Smith")
+        assert success is True
+
+        # Verify no balance consumed yet
+        info = await get_user_balance_info(500)
+        assert info["balance_cents"] == 2000
+        assert info["free_aml_remaining"] == 0
+
+        # 4th check: paid name check ($1.00)
+        success, msg = await charge_name_check(500, "Vladimir Putin")
+        assert success is True
+        assert "Списано" in msg
+
+        balance = await db.get_balance_cents(500)
+        assert balance == 2000 - NAME_CHECK_PRICE_CENTS
+
+    @pytest.mark.asyncio
+    async def test_name_check_with_dilisense_mock(self, patch_db):
+        """Integration: charge + dilisense mock check end-to-end."""
+        db = patch_db
+        await db.upsert_user(600, "checker", "Checker")
+        await db.create_subscription(600, "basic", "monthly", 30)
+
+        from balance import charge_name_check
+        with patch("dilisense.DILISENSE_API_KEY", ""):
+            import dilisense
+            dilisense._cache.clear()
+
+            # Free check + dilisense mock
+            success, charge_msg = await charge_name_check(600, "Vladimir Putin")
+            assert success is True
+
+            result = await dilisense.check_individual("Vladimir Putin")
+            assert result["mock"] is True
+            assert result["risk_level"] == "high"
+            assert "SANCTION" in result["source_types"]
+            assert result["total_hits"] == 2

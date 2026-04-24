@@ -69,6 +69,12 @@ FREE_AML_CHECKS = {
 AMLBOT_API_KEY = os.getenv("AMLBOT_API_KEY", "")
 AMLBOT_BASE_URL = os.getenv("AMLBOT_BASE_URL", "https://extrarpc.amlbot.com/api/v2")
 
+# Dilisense name screening
+DILISENSE_API_KEY = os.getenv('DILISENSE_API_KEY', '')
+DILISENSE_BASE_URL = os.getenv('DILISENSE_BASE_URL', 'https://api.dilisense.com/v1')
+NAME_CHECK_PRICE_USD = 1.00
+NAME_CHECK_PRICE_CENTS = 100
+
 # Database (PostgreSQL on Railway)
 # Railway may use different variable names depending on setup
 DATABASE_URL = (

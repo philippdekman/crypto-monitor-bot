@@ -4,7 +4,7 @@
 """
 import logging
 from config import (
-    MIN_TOPUP_USD, AML_CHECK_PRICE_CENTS, FREE_AML_CHECKS
+    MIN_TOPUP_USD, AML_CHECK_PRICE_CENTS, NAME_CHECK_PRICE_CENTS, FREE_AML_CHECKS
 )
 import database as db
 from hd_wallet import generate_address
@@ -144,3 +144,32 @@ async def charge_aml_check(user_id: int, address: str) -> tuple[bool, str]:
 
     await db.increment_aml_checks_used(user_id)
     return True, f"Списано ${AML_CHECK_PRICE_CENTS / 100:.2f} за AML-проверку"
+
+
+async def charge_name_check(user_id: int, query_ref: str) -> tuple[bool, str]:
+    """Списывает за проверку имени: сначала бесплатные (общая квота с AML), потом с баланса $1.00.
+    Возвращает (успех, сообщение)."""
+    can_free, remaining = await can_use_free_aml_check(user_id)
+
+    if can_free:
+        await db.increment_aml_checks_used(user_id)
+        return True, f"Использована бесплатная проверка (осталось: {remaining - 1})"
+
+    # Try paid check
+    result = await db.debit_balance(
+        user_id=user_id,
+        cents=NAME_CHECK_PRICE_CENTS,
+        tx_type="name_check",
+        description=f"Проверка имени: {query_ref[:30]}",
+        reference_id=query_ref,
+    )
+
+    if result is None:
+        balance_cents = await db.get_balance_cents(user_id)
+        return False, (
+            f"Недостаточно средств. Баланс: ${balance_cents / 100:.2f}, "
+            f"стоимость проверки: ${NAME_CHECK_PRICE_CENTS / 100:.2f}"
+        )
+
+    await db.increment_aml_checks_used(user_id)
+    return True, f"Списано ${NAME_CHECK_PRICE_CENTS / 100:.2f} за проверку имени"
