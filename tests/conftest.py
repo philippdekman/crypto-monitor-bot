@@ -37,10 +37,13 @@ class MockDB:
         self.payments = []
         self.transactions = []
         self.hd_indices = {}
+        self.balances = {}  # user_id -> {balance_cents, aml_checks_used_this_month, aml_checks_reset_at}
+        self.balance_transactions = []
         self._sub_id = 0
         self._addr_id = 0
         self._pay_id = 0
         self._tx_id = 0
+        self._btx_id = 0
 
     async def upsert_user(self, user_id, username=None, first_name=None, language_code="en"):
         self.users[user_id] = {
@@ -172,6 +175,7 @@ class MockDB:
             "status": "pending", "tx_hash": None,
             "created_at": now, "confirmed_at": None,
             "expires_at": now + expires_in,
+            "payment_kind": "subscription",
         }
         self.payments.append(pay)
         return pay
@@ -212,6 +216,90 @@ class MockDB:
         if not sub or sub["plan"] == "free":
             return FREE_ADDRESS_LIMIT
         return PRICING.get(sub["plan"], {}).get("max_addresses", FREE_ADDRESS_LIMIT)
+
+    def _ensure_balance(self, user_id):
+        if user_id not in self.balances:
+            self.balances[user_id] = {
+                "user_id": user_id,
+                "balance_cents": 0,
+                "aml_checks_used_this_month": 0,
+                "aml_checks_reset_at": time.time(),
+                "updated_at": time.time(),
+            }
+        return self.balances[user_id]
+
+    async def get_balance_cents(self, user_id):
+        b = self._ensure_balance(user_id)
+        return b["balance_cents"]
+
+    async def get_balance_info(self, user_id):
+        return dict(self._ensure_balance(user_id))
+
+    async def credit_balance(self, user_id, cents, description=None,
+                             reference_id=None, tx_type="topup"):
+        b = self._ensure_balance(user_id)
+        b["balance_cents"] += cents
+        b["updated_at"] = time.time()
+        self._btx_id += 1
+        tx = {
+            "id": self._btx_id, "user_id": user_id, "type": tx_type,
+            "amount_cents": cents, "balance_after_cents": b["balance_cents"],
+            "description": description, "reference_id": reference_id,
+            "created_at": time.time(),
+        }
+        self.balance_transactions.append(tx)
+        return {"balance_cents": b["balance_cents"], "transaction": tx}
+
+    async def debit_balance(self, user_id, cents, tx_type="aml_check",
+                            description=None, reference_id=None):
+        b = self._ensure_balance(user_id)
+        if b["balance_cents"] < cents:
+            return None
+        b["balance_cents"] -= cents
+        b["updated_at"] = time.time()
+        self._btx_id += 1
+        tx = {
+            "id": self._btx_id, "user_id": user_id, "type": tx_type,
+            "amount_cents": -cents, "balance_after_cents": b["balance_cents"],
+            "description": description, "reference_id": reference_id,
+            "created_at": time.time(),
+        }
+        self.balance_transactions.append(tx)
+        return {"balance_cents": b["balance_cents"], "transaction": tx}
+
+    async def increment_aml_checks_used(self, user_id):
+        b = self._ensure_balance(user_id)
+        now = time.time()
+        if (now - b["aml_checks_reset_at"]) > 30 * 86400:
+            b["aml_checks_used_this_month"] = 1
+            b["aml_checks_reset_at"] = now
+        else:
+            b["aml_checks_used_this_month"] += 1
+        b["updated_at"] = now
+        return b["aml_checks_used_this_month"]
+
+    async def get_balance_transactions(self, user_id, limit=10, offset=0):
+        user_txs = [t for t in self.balance_transactions if t["user_id"] == user_id]
+        user_txs.sort(key=lambda x: x["created_at"], reverse=True)
+        return user_txs[offset:offset + limit]
+
+    async def create_topup_payment(self, user_id, amount_usd, pay_chain,
+                                    pay_address, pay_amount, derivation_idx,
+                                    expires_in=3600):
+        now = time.time()
+        self._pay_id += 1
+        pay = {
+            "id": self._pay_id, "user_id": user_id, "plan": "topup",
+            "period": "one-time", "amount_usd": amount_usd,
+            "pay_chain": pay_chain, "pay_address": pay_address,
+            "pay_amount": pay_amount, "derivation_idx": derivation_idx,
+            "status": "pending", "tx_hash": None,
+            "created_at": now, "confirmed_at": None,
+            "expires_at": now + expires_in,
+            "payment_kind": "balance_topup",
+        }
+        self.payments.append(pay)
+        return pay
 
     async def get_pool(self):
         return MagicMock()

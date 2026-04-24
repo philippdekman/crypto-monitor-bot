@@ -52,6 +52,23 @@ MIN_TX_VALUE_USD = 10.0
 # Subscription reminders (days before expiry)
 REMINDER_DAYS = [30, 7, 3, 1]
 
+# Balance system
+MIN_TOPUP_USD = 5.0
+TOPUP_AMOUNTS = [5, 10, 25, 50]  # quick buttons
+AML_CHECK_PRICE_USD = 0.50
+AML_CHECK_PRICE_CENTS = 50
+
+# Free AML checks per plan per month
+FREE_AML_CHECKS = {
+    "free": 0,
+    "basic": 3,
+    "premium": 20,
+}
+
+# AMLBot API
+AMLBOT_API_KEY = os.getenv("AMLBOT_API_KEY", "")
+AMLBOT_BASE_URL = os.getenv("AMLBOT_BASE_URL", "https://extrarpc.amlbot.com/api/v2")
+
 # Database (PostgreSQL on Railway)
 # Railway may use different variable names depending on setup
 DATABASE_URL = (

@@ -129,7 +129,8 @@ async def create_payment_invoice(user_id: int, plan: str, period: str, pay_chain
 
 
 async def check_pending_payments() -> list[dict]:
-    """Check all pending payments for incoming transactions. Returns confirmed ones."""
+    """Check all pending payments for incoming transactions. Returns confirmed ones.
+    Routes by payment_kind: 'subscription' activates plan, 'balance_topup' credits balance."""
     from chains import get_transactions
 
     confirmed = []
@@ -139,6 +140,7 @@ async def check_pending_payments() -> list[dict]:
         pay_chain = payment["pay_chain"]
         pay_address = payment["pay_address"]
         expected_amount = float(payment["pay_amount"])
+        payment_kind = payment.get("payment_kind") or "subscription"
 
         try:
             txs = await get_transactions(pay_chain, pay_address)
@@ -155,24 +157,40 @@ async def check_pending_payments() -> list[dict]:
                 if received >= expected_amount * 0.99:
                     await db.confirm_payment(payment["id"], tx["tx_hash"])
 
-                    # Activate subscription
-                    duration = 365 if payment["period"] == "yearly" else 30
-                    await db.create_subscription(
-                        payment["user_id"], payment["plan"],
-                        payment["period"], duration
-                    )
-
-                    confirmed.append({
-                        "user_id": payment["user_id"],
-                        "payment_id": payment["id"],
-                        "plan": payment["plan"],
-                        "period": payment["period"],
-                        "tx_hash": tx["tx_hash"],
-                        "amount": tx["value"],
-                        "symbol": tx["symbol"],
-                    })
-                    logger.info(f"Payment confirmed: user={payment['user_id']}, "
-                                f"plan={payment['plan']}, tx={tx['tx_hash'][:16]}...")
+                    if payment_kind == "balance_topup":
+                        # Credit user balance
+                        from balance import credit_topup
+                        await credit_topup(payment["user_id"], payment["id"], payment["amount_usd"])
+                        confirmed.append({
+                            "user_id": payment["user_id"],
+                            "payment_id": payment["id"],
+                            "payment_kind": "balance_topup",
+                            "amount_usd": payment["amount_usd"],
+                            "tx_hash": tx["tx_hash"],
+                            "amount": tx["value"],
+                            "symbol": tx["symbol"],
+                        })
+                        logger.info(f"Topup confirmed: user={payment['user_id']}, "
+                                    f"${payment['amount_usd']}, tx={tx['tx_hash'][:16]}...")
+                    else:
+                        # Activate subscription (original behavior)
+                        duration = 365 if payment["period"] == "yearly" else 30
+                        await db.create_subscription(
+                            payment["user_id"], payment["plan"],
+                            payment["period"], duration
+                        )
+                        confirmed.append({
+                            "user_id": payment["user_id"],
+                            "payment_id": payment["id"],
+                            "payment_kind": "subscription",
+                            "plan": payment["plan"],
+                            "period": payment["period"],
+                            "tx_hash": tx["tx_hash"],
+                            "amount": tx["value"],
+                            "symbol": tx["symbol"],
+                        })
+                        logger.info(f"Payment confirmed: user={payment['user_id']}, "
+                                    f"plan={payment['plan']}, tx={tx['tx_hash'][:16]}...")
                     break
 
     # Expire old payments

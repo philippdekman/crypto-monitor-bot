@@ -110,6 +110,37 @@ async def init_db():
         );
         """)
 
+        # Balance system tables
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS user_balance (
+            user_id BIGINT PRIMARY KEY,
+            balance_cents BIGINT NOT NULL DEFAULT 0,
+            aml_checks_used_this_month INT NOT NULL DEFAULT 0,
+            aml_checks_reset_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS balance_transactions (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            type TEXT NOT NULL,
+            amount_cents BIGINT NOT NULL,
+            balance_after_cents BIGINT NOT NULL,
+            description TEXT,
+            reference_id TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+
+        # Add payment_kind column to payments (migration-safe)
+        await conn.execute("""
+        DO $$ BEGIN
+            ALTER TABLE payments ADD COLUMN payment_kind TEXT DEFAULT 'subscription';
+        EXCEPTION
+            WHEN duplicate_column THEN NULL;
+        END $$;
+        """)
+
         # Create indexes if not exist
         await conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_mon_user ON monitored_addresses(user_id, is_active);
@@ -117,6 +148,7 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_sub_user ON subscriptions(user_id, is_active);
         CREATE INDEX IF NOT EXISTS idx_pay_status ON payments(status);
         CREATE INDEX IF NOT EXISTS idx_txlog_monitor ON transactions_log(monitor_id);
+        CREATE INDEX IF NOT EXISTS idx_balance_tx_user ON balance_transactions(user_id, created_at DESC);
         """)
 
     logger.info("Database initialized (PostgreSQL)")
@@ -412,3 +444,158 @@ async def expire_old_payments():
             UPDATE payments SET status='expired'
             WHERE status='pending' AND expires_at <= $1
         """, time.time())
+
+
+# ── Balance operations ──────────────────────────────────────
+
+async def get_balance_cents(user_id: int) -> int:
+    """Get user's balance in cents. Creates row with 0 if missing."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT balance_cents FROM user_balance WHERE user_id=$1", user_id
+        )
+        if row:
+            return row["balance_cents"]
+        await conn.execute(
+            "INSERT INTO user_balance (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+        )
+        return 0
+
+
+async def get_balance_info(user_id: int) -> dict:
+    """Get balance, aml_used, reset_at for a user."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM user_balance WHERE user_id=$1", user_id
+        )
+        if not row:
+            await conn.execute(
+                "INSERT INTO user_balance (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+            )
+            row = await conn.fetchrow(
+                "SELECT * FROM user_balance WHERE user_id=$1", user_id
+            )
+        return _rec(row)
+
+
+async def credit_balance(user_id: int, cents: int, description: str = None,
+                         reference_id: str = None, tx_type: str = "topup") -> dict:
+    """Atomically credit balance. Returns new balance + tx record."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            # Ensure row exists
+            await conn.execute(
+                "INSERT INTO user_balance (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+            )
+            row = await conn.fetchrow("""
+                UPDATE user_balance
+                SET balance_cents = balance_cents + $1, updated_at = NOW()
+                WHERE user_id = $2
+                RETURNING balance_cents
+            """, cents, user_id)
+            new_balance = row["balance_cents"]
+
+            tx = await conn.fetchrow("""
+                INSERT INTO balance_transactions
+                (user_id, type, amount_cents, balance_after_cents, description, reference_id)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING *
+            """, user_id, tx_type, cents, new_balance, description, reference_id)
+
+            return {"balance_cents": new_balance, "transaction": _rec(tx)}
+
+
+async def debit_balance(user_id: int, cents: int, tx_type: str = "aml_check",
+                        description: str = None, reference_id: str = None) -> dict | None:
+    """Atomically debit balance with SELECT FOR UPDATE. Returns None if insufficient."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT balance_cents FROM user_balance WHERE user_id=$1 FOR UPDATE",
+                user_id
+            )
+            if not row or row["balance_cents"] < cents:
+                return None
+
+            updated = await conn.fetchrow("""
+                UPDATE user_balance
+                SET balance_cents = balance_cents - $1, updated_at = NOW()
+                WHERE user_id = $2
+                RETURNING balance_cents
+            """, cents, user_id)
+            new_balance = updated["balance_cents"]
+
+            tx = await conn.fetchrow("""
+                INSERT INTO balance_transactions
+                (user_id, type, amount_cents, balance_after_cents, description, reference_id)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING *
+            """, user_id, tx_type, -cents, new_balance, description, reference_id)
+
+            return {"balance_cents": new_balance, "transaction": _rec(tx)}
+
+
+async def increment_aml_checks_used(user_id: int) -> int:
+    """Increment AML checks used this month. Handles monthly reset if >30 days since reset_at."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "INSERT INTO user_balance (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id
+            )
+            row = await conn.fetchrow(
+                "SELECT aml_checks_used_this_month, aml_checks_reset_at FROM user_balance WHERE user_id=$1 FOR UPDATE",
+                user_id
+            )
+            from datetime import datetime, timezone, timedelta
+            reset_at = row["aml_checks_reset_at"]
+            now = datetime.now(timezone.utc)
+            if reset_at is None or (now - reset_at) > timedelta(days=30):
+                # Reset counter
+                await conn.execute("""
+                    UPDATE user_balance
+                    SET aml_checks_used_this_month = 1, aml_checks_reset_at = NOW(), updated_at = NOW()
+                    WHERE user_id = $1
+                """, user_id)
+                return 1
+            else:
+                updated = await conn.fetchrow("""
+                    UPDATE user_balance
+                    SET aml_checks_used_this_month = aml_checks_used_this_month + 1, updated_at = NOW()
+                    WHERE user_id = $1
+                    RETURNING aml_checks_used_this_month
+                """, user_id)
+                return updated["aml_checks_used_this_month"]
+
+
+async def get_balance_transactions(user_id: int, limit: int = 10, offset: int = 0) -> list:
+    """Get recent balance transactions for a user."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT * FROM balance_transactions
+            WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3
+        """, user_id, limit, offset)
+        return _recs(rows)
+
+
+async def create_topup_payment(user_id: int, amount_usd: float, pay_chain: str,
+                               pay_address: str, pay_amount: str,
+                               derivation_idx: int, expires_in: int = 3600) -> dict:
+    """Create a balance topup payment record."""
+    now = time.time()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            INSERT INTO payments
+            (user_id, plan, period, amount_usd, pay_chain, pay_address,
+             pay_amount, derivation_idx, status, expires_at, payment_kind)
+            VALUES ($1, 'topup', 'one-time', $2, $3, $4, $5, $6, 'pending', $7, 'balance_topup')
+            RETURNING *
+        """, user_id, amount_usd, pay_chain, pay_address,
+            pay_amount, derivation_idx, now + expires_in)
+        return _rec(row)

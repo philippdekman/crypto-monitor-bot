@@ -29,7 +29,8 @@ from telegram.constants import ParseMode
 
 from config import (
     TELEGRAM_BOT_TOKEN, ADMIN_USER_IDS, MONITOR_INTERVAL_SECONDS,
-    FREE_ADDRESS_LIMIT, PRICING
+    FREE_ADDRESS_LIMIT, PRICING, TOPUP_AMOUNTS, MIN_TOPUP_USD,
+    AML_CHECK_PRICE_USD, FREE_AML_CHECKS
 )
 import database as db
 from chains import detect_chains, CHAIN_HANDLERS, get_token_list
@@ -42,6 +43,10 @@ from subscription import (
     check_pending_payments, get_expiring_subscriptions_to_notify,
     format_pricing_text
 )
+from balance import (
+    get_user_balance_info, create_topup_invoice, charge_aml_check
+)
+import aml
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,6 +64,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db.upsert_user(user.id, user.username, user.first_name, user.language_code or "en")
     await db.create_free_subscription(user.id)
 
+    # Get balance for button text
+    balance_info = await get_user_balance_info(user.id)
+    balance_usd = balance_info["balance_usd"]
+
     text = (
         f"👋 <b>Привет, {user.first_name}!</b>\n\n"
         f"Я мониторю крипто-адреса и сообщаю о входящих/исходящих транзакциях в реальном времени.\n\n"
@@ -74,6 +83,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("➕ Добавить адрес", callback_data="menu_add"),
          InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+        [InlineKeyboardButton(f"💰 Баланс: ${balance_usd:.2f}", callback_data="menu_balance")],
         [InlineKeyboardButton("💳 Подписка", callback_data="menu_subscribe"),
          InlineKeyboardButton("ℹ️ Помощь", callback_data="menu_help")],
     ]
@@ -235,6 +245,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_main":
         user = update.effective_user
+        balance_info = await get_user_balance_info(user_id)
+        balance_usd = balance_info["balance_usd"]
         text = (
             f"👋 <b>Привет, {user.first_name}!</b>\n\n"
             f"Я мониторю крипто-адреса и сообщаю о входящих/исходящих транзакциях в реальном времени.\n\n"
@@ -250,6 +262,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("➕ Добавить адрес", callback_data="menu_add"),
              InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+            [InlineKeyboardButton(f"💰 Баланс: ${balance_usd:.2f}", callback_data="menu_balance")],
             [InlineKeyboardButton("💳 Подписка", callback_data="menu_subscribe"),
              InlineKeyboardButton("ℹ️ Помощь", callback_data="menu_help")],
         ]
@@ -299,6 +312,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "menu_balance":
+        await show_balance_menu(query, user_id)
+        return
+
     # ── Per-address actions ───────────────────────────────
 
     if data.startswith("addr_balance:"):
@@ -327,6 +344,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         display_symbol = balance_info.get("symbol", symbol)
 
         buttons = [
+            [InlineKeyboardButton("🔍 AML-проверка", callback_data=f"aml_check:{monitor_id}")],
             [InlineKeyboardButton("🔄 Заменить", callback_data=f"addr_replace:{monitor_id}"),
              InlineKeyboardButton("🗑 Удалить", callback_data=f"addr_delete:{monitor_id}")],
             [InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
@@ -416,6 +434,57 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ Адрес удалён из мониторинга.",
             reply_markup=InlineKeyboardMarkup(keyboard),
         )
+        return
+
+    # ── AML check ─────────────────────────────────────────
+
+    if data.startswith("aml_check:"):
+        monitor_id = int(data.split(":")[1])
+        addresses = await db.get_user_addresses(user_id)
+        addr = next((a for a in addresses if a["id"] == monitor_id), None)
+        if not addr:
+            await query.edit_message_text("❌ Адрес не найден.")
+            return
+        await perform_aml_check(query, user_id, addr)
+        return
+
+    # ── Balance / Topup flow ─────────────────────────────
+
+    if data.startswith("topup_amount:"):
+        amount = data.split(":")[1]
+        if amount == "select":
+            await show_topup_amount_selection(query)
+            return
+        if amount == "custom":
+            context.user_data["awaiting_custom_topup"] = True
+            await query.edit_message_text(
+                f"✏️ Введите сумму пополнения в USD (минимум ${MIN_TOPUP_USD:.0f}):"
+            )
+            return
+        amount_usd = float(amount)
+        context.user_data["topup_amount"] = amount_usd
+        await show_topup_chain_selection(query, amount_usd)
+        return
+
+    if data.startswith("topup_pay:"):
+        parts = data.split(":")
+        amount_usd = float(parts[1])
+        pay_chain = parts[2]
+        await create_and_show_topup_invoice(query, context, user_id, amount_usd, pay_chain)
+        return
+
+    if data.startswith("check_topup:"):
+        payment_id = int(data.split(":")[1])
+        await check_topup_status(query, user_id, payment_id)
+        return
+
+    if data == "balance_history":
+        await show_balance_history(query, user_id, offset=0)
+        return
+
+    if data.startswith("bal_hist:"):
+        offset = int(data.split(":")[1])
+        await show_balance_history(query, user_id, offset=offset)
         return
 
     # ── Cancel ────────────────────────────────────────────
@@ -581,6 +650,287 @@ async def add_and_show_balance(query, user_id, address, chain,
     ]
     await query.edit_message_text(
         text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.HTML
+    )
+
+
+# ── Balance menu ─────────────────────────────────────────────
+
+async def show_balance_menu(query, user_id):
+    info = await get_user_balance_info(user_id)
+    balance_usd = info["balance_usd"]
+    plan = info["plan"]
+    free_total = info["free_aml_total"]
+    free_remaining = info["free_aml_remaining"]
+
+    text = (
+        f"💰 <b>Ваш баланс: ${balance_usd:.2f}</b>\n\n"
+        f"🔍 <b>AML-проверки:</b>\n"
+        f"  Бесплатных осталось: {free_remaining}/{free_total} (план {plan.upper()})\n"
+        f"  Платных: ${AML_CHECK_PRICE_USD:.2f} за проверку\n"
+    )
+
+    buttons = [
+        [InlineKeyboardButton("➕ Пополнить", callback_data="topup_amount:select"),
+         InlineKeyboardButton("📋 История", callback_data="balance_history")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="menu_main")],
+    ]
+    await query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+    )
+
+
+async def show_topup_amount_selection(query):
+    buttons = []
+    row = []
+    for amount in TOPUP_AMOUNTS:
+        row.append(InlineKeyboardButton(f"${amount}", callback_data=f"topup_amount:{amount}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("✏️ Своя сумма", callback_data="topup_amount:custom")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="menu_balance")])
+
+    await query.edit_message_text(
+        "💰 <b>Пополнение баланса</b>\n\nВыберите сумму:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def show_topup_chain_selection(query, amount_usd):
+    buttons = [
+        [InlineKeyboardButton("₿ Bitcoin (BTC)", callback_data=f"topup_pay:{amount_usd}:BTC")],
+        [InlineKeyboardButton("⟠ Ethereum (ETH)", callback_data=f"topup_pay:{amount_usd}:ETH")],
+        [InlineKeyboardButton("◈ TRON (TRX)", callback_data=f"topup_pay:{amount_usd}:TRON")],
+        [InlineKeyboardButton("⬡ BSC (BNB)", callback_data=f"topup_pay:{amount_usd}:BSC")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="topup_amount:select")],
+    ]
+    await query.edit_message_text(
+        f"💰 <b>Пополнение на ${amount_usd:.2f}</b>\n\n"
+        f"💳 Выберите криптовалюту для оплаты:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def create_and_show_topup_invoice(query, context, user_id, amount_usd, pay_chain):
+    await query.edit_message_text("⏳ Генерирую платёжный адрес...")
+
+    try:
+        invoice = await create_topup_invoice(user_id, amount_usd, pay_chain)
+    except Exception as e:
+        logger.error(f"Topup invoice creation error: {e}")
+        invoice = None
+
+    if not invoice:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔄 Попробовать снова",
+                                  callback_data=f"topup_pay:{amount_usd}:{pay_chain}")],
+            [InlineKeyboardButton("💳 Другая валюта",
+                                  callback_data=f"topup_amount:{amount_usd}")],
+            [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+        ])
+        await query.edit_message_text(
+            "❌ Не удалось создать счёт.\n\n"
+            "Попробуйте ещё раз или выберите другую криптовалюту.",
+            reply_markup=kb,
+        )
+        return
+
+    text = (
+        f"💰 <b>Счёт на пополнение баланса</b>\n\n"
+        f"💵 Сумма: ${invoice['amount_usd']:.2f}\n"
+        f"💰 К оплате: <b>{invoice['amount_crypto']} {invoice['symbol']}</b>\n\n"
+        f"📍 Отправьте точную сумму на адрес:\n"
+        f"<code>{invoice['address']}</code>\n\n"
+        f"⏰ Адрес действителен {invoice['expires_in_minutes']} минут.\n"
+        f"⚠️ Отправляйте <b>только {invoice['symbol']}</b> на этот адрес!\n\n"
+        f"После отправки нажмите кнопку ниже для проверки."
+    )
+
+    buttons = [
+        [InlineKeyboardButton("🔍 Проверить оплату",
+                              callback_data=f"check_topup:{invoice['payment_id']}")],
+        [InlineKeyboardButton("❌ Отменить", callback_data="menu_balance")],
+    ]
+    await query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+    )
+
+
+async def check_topup_status(query, user_id, payment_id):
+    await query.answer("🔍 Проверяю...")
+
+    try:
+        confirmed = await check_pending_payments()
+    except Exception as e:
+        logger.error(f"Topup check error: {e}")
+        confirmed = []
+
+    for c in confirmed:
+        if (c.get("payment_id") == payment_id or c["user_id"] == user_id) \
+                and c.get("payment_kind") == "balance_topup":
+            balance_cents = await db.get_balance_cents(user_id)
+            await query.edit_message_text(
+                f"✅ <b>Баланс пополнен на ${c['amount_usd']:.2f}!</b>\n\n"
+                f"💰 Текущий баланс: ${balance_cents / 100:.2f}\n"
+                f"🔗 TX: <code>{c['tx_hash'][:16]}...</code>",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💰 Баланс", callback_data="menu_balance")],
+                    [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+                ]),
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+    buttons = [
+        [InlineKeyboardButton("🔍 Проверить снова",
+                              callback_data=f"check_topup:{payment_id}")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+    ]
+    await query.edit_message_text(
+        "⏳ Оплата пока не обнаружена.\n\n"
+        "Транзакция может занять несколько минут.\n"
+        "Нажмите кнопку для повторной проверки.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def show_balance_history(query, user_id, offset=0):
+    txs = await db.get_balance_transactions(user_id, limit=10, offset=offset)
+
+    if not txs:
+        text = "📋 <b>История операций</b>\n\nОпераций пока нет."
+        buttons = [[InlineKeyboardButton("⬅️ Назад", callback_data="menu_balance")]]
+        await query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+        )
+        return
+
+    type_labels = {
+        "topup": "➕ Пополнение",
+        "aml_check": "🔍 AML-проверка",
+        "refund": "↩️ Возврат",
+        "bonus": "🎁 Бонус",
+        "adjustment": "⚙️ Корректировка",
+    }
+
+    text = "📋 <b>История операций</b>\n\n"
+    for tx in txs:
+        label = type_labels.get(tx["type"], tx["type"])
+        amount = tx["amount_cents"] / 100
+        sign = "+" if amount > 0 else ""
+        ts = tx["created_at"]
+        if isinstance(ts, (int, float)):
+            date_str = datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+        else:
+            date_str = str(ts)[:16]
+        desc = tx.get("description") or ""
+        text += f"{label}: <b>{sign}${amount:.2f}</b>\n"
+        if desc:
+            text += f"  <i>{desc}</i>\n"
+        text += f"  {date_str}\n\n"
+
+    buttons = []
+    nav_row = []
+    nav_row.append(InlineKeyboardButton("⬅️ Назад", callback_data="menu_balance"))
+    if offset > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Новее", callback_data=f"bal_hist:{max(0, offset - 10)}"))
+    if len(txs) == 10:
+        nav_row.append(InlineKeyboardButton("Старее ➡️", callback_data=f"bal_hist:{offset + 10}"))
+    buttons.append(nav_row)
+
+    await query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
+    )
+
+
+async def perform_aml_check(query, user_id, addr):
+    """Выполняет AML-проверку адреса."""
+    address = addr["address"]
+    chain = addr["chain"]
+    chain_name = CHAIN_HANDLERS.get(chain, {}).get("name", chain)
+
+    await query.edit_message_text(
+        f"🔍 <b>Проверяем адрес...</b>\n"
+        f"<code>{address[:20]}...</code>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    # Charge for the check
+    success, charge_msg = await charge_aml_check(user_id, address)
+    if not success:
+        buttons = [
+            [InlineKeyboardButton("➕ Пополнить баланс", callback_data="topup_amount:select")],
+            [InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+        ]
+        await query.edit_message_text(
+            f"❌ {charge_msg}",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Perform AML check
+    result = await aml.check_address(address, chain)
+
+    if "error" in result:
+        # Refund: error should not charge
+        await db.credit_balance(
+            user_id, AML_CHECK_PRICE_USD * 100,
+            description="Возврат за неудачную AML-проверку",
+            reference_id=address,
+            tx_type="refund",
+        )
+        buttons = [[InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")]]
+        await query.edit_message_text(
+            f"❌ Ошибка AML-проверки: {result['error']}\n"
+            f"Средства возвращены на баланс.",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    # Format result
+    risk_score = result["risk_score"]
+    risk_level = result["risk_level"]
+
+    if risk_score <= 30:
+        risk_emoji = "🟢"
+        risk_text = "Низкий"
+    elif risk_score <= 70:
+        risk_emoji = "🟡"
+        risk_text = "Средний"
+    else:
+        risk_emoji = "🔴"
+        risk_text = "Высокий"
+
+    text = (
+        f"🔍 <b>AML-проверка</b>\n"
+        f"Адрес: <code>{address[:20]}...</code>\n"
+        f"Сеть: {chain_name}\n\n"
+        f"{risk_emoji} <b>Риск: {risk_text} ({risk_score}/100)</b>\n"
+    )
+
+    if result["signals"]:
+        text += "\n<b>Сигналы:</b>\n"
+        for sig in result["signals"]:
+            text += f"  • {sig}\n"
+
+    if result.get("mock"):
+        text += "\n<i>(🧪 тестовый режим)</i>"
+
+    text += f"\n<i>{charge_msg}</i>"
+
+    buttons = [
+        [InlineKeyboardButton("📋 Мои адреса", callback_data="menu_list")],
+        [InlineKeyboardButton("🏠 Главное меню", callback_data="menu_main")],
+    ]
+    await query.edit_message_text(
+        text, reply_markup=InlineKeyboardMarkup(buttons), parse_mode=ParseMode.HTML
     )
 
 
@@ -896,6 +1246,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text.startswith("/"):
         return
 
+    # Handle custom topup amount
+    if context.user_data.get("awaiting_custom_topup"):
+        context.user_data.pop("awaiting_custom_topup", None)
+        try:
+            amount = float(text.replace(",", ".").replace("$", "").strip())
+        except ValueError:
+            await update.message.reply_text(
+                f"❌ Неверная сумма. Введите число (минимум ${MIN_TOPUP_USD:.0f})."
+            )
+            return
+        if amount < MIN_TOPUP_USD:
+            await update.message.reply_text(
+                f"❌ Минимальная сумма пополнения: ${MIN_TOPUP_USD:.0f}."
+            )
+            return
+        # Show chain selection via a new message (can't edit since this is a new message)
+        buttons = [
+            [InlineKeyboardButton("₿ Bitcoin (BTC)", callback_data=f"topup_pay:{amount}:BTC")],
+            [InlineKeyboardButton("⟠ Ethereum (ETH)", callback_data=f"topup_pay:{amount}:ETH")],
+            [InlineKeyboardButton("◈ TRON (TRX)", callback_data=f"topup_pay:{amount}:TRON")],
+            [InlineKeyboardButton("⬡ BSC (BNB)", callback_data=f"topup_pay:{amount}:BSC")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="menu_balance")],
+        ]
+        await update.message.reply_text(
+            f"💰 <b>Пополнение на ${amount:.2f}</b>\n\n"
+            f"💳 Выберите криптовалюту для оплаты:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
     # Try to detect as crypto address
     chains = detect_chains(text)
     if chains:
@@ -973,15 +1354,26 @@ async def monitoring_loop(app: Application):
             confirmed = await check_pending_payments()
             for c in confirmed:
                 try:
-                    await app.bot.send_message(
-                        chat_id=c["user_id"],
-                        text=(
-                            f"✅ <b>Оплата подтверждена!</b>\n\n"
-                            f"📦 План: {c['plan'].capitalize()}\n"
-                            f"🎉 Подписка активирована!"
-                        ),
-                        parse_mode=ParseMode.HTML
-                    )
+                    if c.get("payment_kind") == "balance_topup":
+                        balance_cents = await db.get_balance_cents(c["user_id"])
+                        await app.bot.send_message(
+                            chat_id=c["user_id"],
+                            text=(
+                                f"✅ <b>Баланс пополнен на ${c['amount_usd']:.2f}!</b>\n\n"
+                                f"💰 Текущий баланс: ${balance_cents / 100:.2f}"
+                            ),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    else:
+                        await app.bot.send_message(
+                            chat_id=c["user_id"],
+                            text=(
+                                f"✅ <b>Оплата подтверждена!</b>\n\n"
+                                f"📦 План: {c.get('plan', '').capitalize()}\n"
+                                f"🎉 Подписка активирована!"
+                            ),
+                            parse_mode=ParseMode.HTML,
+                        )
                 except Exception as e:
                     logger.error(f"Failed to notify payment for user {c['user_id']}: {e}")
 

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 
-from config import FREE_ADDRESS_LIMIT, PRICING
+from config import FREE_ADDRESS_LIMIT, PRICING, AML_CHECK_PRICE_CENTS, FREE_AML_CHECKS
 
 
 # ══════════════════════════════════════════════════════════════
@@ -296,3 +296,91 @@ class TestEdgeCases:
         a2 = await db.add_monitored_address(100, "TAddr1", "TRON")
         assert a1["id"] == a2["id"]
         assert await db.count_user_addresses(100) == 1
+
+
+# ══════════════════════════════════════════════════════════════
+#  Balance topup + AML check integration
+# ══════════════════════════════════════════════════════════════
+
+class TestTopupAndAmlFlow:
+    @pytest.mark.asyncio
+    async def test_full_topup_confirm_aml_debit(self, patch_db):
+        """Full flow: create topup → confirm payment → balance credited → AML check → balance debited."""
+        db = patch_db
+        await db.upsert_user(100, "alice", "Alice")
+        await db.create_free_subscription(100)
+
+        # 1. Create topup invoice
+        with patch("balance.generate_address", return_value={
+            "address": "TTopupAddr", "path": "m/44'/195'/0'/0/0",
+            "chain": "TRON", "index": 0,
+        }), patch("balance.convert_from_usd", new_callable=AsyncMock, return_value=100.0):
+            from balance import create_topup_invoice
+            invoice = await create_topup_invoice(100, 10.0, "TRON")
+            assert invoice is not None
+
+        # 2. Confirm payment
+        mock_txs = [{
+            "tx_hash": "topup_tx_abc",
+            "direction": "in",
+            "value": "100.00000000",
+            "symbol": "TRX",
+            "from_addr": "TSender",
+            "to_addr": "TTopupAddr",
+        }]
+
+        with patch("chains.get_transactions", new_callable=AsyncMock, return_value=mock_txs):
+            from subscription import check_pending_payments
+            confirmed = await check_pending_payments()
+
+        assert len(confirmed) == 1
+        assert confirmed[0]["payment_kind"] == "balance_topup"
+
+        # 3. Verify balance
+        balance = await db.get_balance_cents(100)
+        assert balance == 1000  # $10
+
+        # 4. AML check (paid — free plan has 0 free)
+        from balance import charge_aml_check
+        ok, msg = await charge_aml_check(100, "TTestAddr")
+        assert ok is True
+
+        # 5. Balance deducted
+        balance = await db.get_balance_cents(100)
+        assert balance == 1000 - AML_CHECK_PRICE_CENTS
+
+    @pytest.mark.asyncio
+    async def test_plan_upgrade_gives_free_aml_checks(self, patch_db):
+        """Free plan → Basic plan gives 3 free AML checks, then paid kicks in."""
+        db = patch_db
+        await db.upsert_user(100, "alice", "Alice")
+        await db.create_free_subscription(100)
+        await db.credit_balance(100, 5000)  # $50
+
+        # Free plan: no free checks
+        from balance import can_use_free_aml_check, charge_aml_check
+        can, remaining = await can_use_free_aml_check(100)
+        assert can is False
+
+        # Upgrade to basic
+        await db.create_subscription(100, "basic", "monthly", 30)
+
+        # Now has 3 free checks
+        can, remaining = await can_use_free_aml_check(100)
+        assert can is True
+        assert remaining == FREE_AML_CHECKS["basic"]
+
+        # Use all free checks
+        for i in range(FREE_AML_CHECKS["basic"]):
+            ok, msg = await charge_aml_check(100, f"addr_{i}")
+            assert ok is True
+
+        # Balance should still be $50 (free checks don't cost money)
+        balance = await db.get_balance_cents(100)
+        assert balance == 5000
+
+        # Next check should be paid
+        ok, msg = await charge_aml_check(100, "addr_paid")
+        assert ok is True
+        balance = await db.get_balance_cents(100)
+        assert balance == 5000 - AML_CHECK_PRICE_CENTS
